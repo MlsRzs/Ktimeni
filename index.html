@@ -1,0 +1,463 @@
+<!DOCTYPE html> 
+<html lang="el">
+<head>
+  <meta charset="UTF-8" />
+  <title>Cesium Drawing & Export with Area & DXF</title>
+  <script src="https://cdn.jsdelivr.net/npm/cesium@1.105/Build/Cesium/Cesium.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/cesium@1.105/Build/Cesium/Widgets/widgets.css" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.7.6/proj4.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dxf-writer@1.0.6/dist/dxf-writer.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+  <style>
+    html, body, #cesiumContainer {
+      width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden;
+      font-family: sans-serif;
+      background-color: #000;
+    }
+    #toolbar {
+      position: absolute; top: 10px; left: 10px; z-index: 10;
+      background: rgba(0, 0, 0, 0.7); padding: 10px; color: white;
+      border-radius: 5px;
+      user-select: none;
+    }
+    #toolbar button {
+      margin: 5px; padding: 6px 10px; cursor: pointer;
+      background-color: #333;
+      border: none;
+      color: white;
+      border-radius: 3px;
+      font-weight: bold;
+    }
+    #toolbar button:hover {
+      background-color: #555;
+    }
+    #info {
+      position: absolute; bottom: 10px; left: 10px; z-index: 10;
+      background: rgba(0,0,0,0.7); color: white; padding: 10px;
+      border-radius: 5px;
+      max-width: 350px;
+      font-size: 15px;
+      white-space: pre-wrap;
+      font-family: monospace;
+      pointer-events: none;
+      user-select: text;
+      font-weight: bold;
+      text-shadow: 0 0 4px #000;
+    }
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+  <div id="toolbar">
+    <button onclick="startDrawing('point')">Draw Point</button>
+    <button onclick="startDrawing('line')">Draw Line</button>
+    <button onclick="startDrawing('polygon')">Draw Polygon</button>
+    <button onclick="finishDrawing()">Finish Drawing</button>
+    <button onclick="exportGeoJSON()">Export GeoJSON</button>
+    <button onclick="exportDXF()">Export DXF (EGSA87)</button>
+    <button onclick="clearAll()">Clear All</button>
+    <button onclick="openMyGeoData()">Upload GeoJSON to mapshaper</button>
+  </div>
+  <div id="info">Ξεκίνησε να σχεδιάζεις...</div>
+
+<script>
+  Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiIzYzAwMGNlYy1mMzlkLTRhZWYtOTdhMS1iMGRlMjhlYjE3YTUiLCJpZCI6MTE1MjkyLCJpYXQiOjE3NDg2OTA3NDZ9.VHdQX8anUDDC3BGhvq9CHGp-iI3NLcPHkzpqZriiSKw';
+
+  const viewer = new Cesium.Viewer('cesiumContainer', {
+    terrainProvider: Cesium.createWorldTerrain(),
+    selectionIndicator: false,
+    infoBox: false
+  });
+
+  Cesium.IonResource.fromAssetId(1461525).then(resource => {
+    const tileset = new Cesium.Cesium3DTileset({ url: resource });
+    viewer.scene.primitives.add(tileset);
+    viewer.zoomTo(tileset);
+  }).catch(err => {
+    console.warn('Tileset load failed:', err);
+  });
+
+  let drawingMode = null;
+  let drawing = false;
+  let handler = new Cesium.ScreenSpaceEventHandler(viewer.canvas);
+  let positions = [];
+  let entities = [];
+  const info = document.getElementById('info');
+
+  function updateInfo() {
+    if (positions.length === 0) {
+      info.textContent = "Ξεκίνησε να σχεδιάζεις...";
+      return;
+    }
+    let text = `Σχεδιασμός: ${drawingMode.toUpperCase()}\n`;
+    positions.forEach((p, i) => {
+      const c = Cesium.Cartographic.fromCartesian(p);
+      const lon = Cesium.Math.toDegrees(c.longitude).toFixed(6);
+      const lat = Cesium.Math.toDegrees(c.latitude).toFixed(6);
+      const alt = c.height.toFixed(2);
+      text += `#${i+1} Lon: ${lon}, Lat: ${lat}, Alt: ${alt}m\n`;
+    });
+    if (drawingMode === 'polygon' && positions.length >= 3) {
+      const coords = positions.map(p => {
+        const c = Cesium.Cartographic.fromCartesian(p);
+        return [Cesium.Math.toDegrees(c.longitude), Cesium.Math.toDegrees(c.latitude)];
+      });
+      coords.push(coords[0]);
+      const polygonGeoJSON = {
+        type: "Feature",
+        geometry: { type: "Polygon", coordinates: [coords] }
+      };
+      const area = turf.area(polygonGeoJSON);
+      text += `\nΕμβαδό πολυγώνου: ${area.toFixed(2)} τ.μ.\n`;
+    }
+    info.textContent = text;
+  }
+
+  function startDrawing(mode) {
+    if(drawing) finishDrawing();
+    drawingMode = mode;
+    positions = [];
+    entities.forEach(e => viewer.entities.remove(e));
+    entities = [];
+    drawing = true;
+
+    handler.setInputAction(event => {
+      const cartesian = viewer.scene.pickPosition(event.position);
+      if (!cartesian) return;
+
+      positions.push(cartesian);
+
+      entities.forEach(e => viewer.entities.remove(e));
+      entities = [];
+
+      positions.forEach((pos, i) => {
+        let pointColor = Cesium.Color.YELLOW;
+        if (drawingMode === 'point') pointColor = Cesium.Color.LIME;
+
+        let pointSize = 8;
+        if (drawingMode === 'point') pointSize = 8;
+
+        const c = Cesium.Cartographic.fromCartesian(pos);
+        const lon = Cesium.Math.toDegrees(c.longitude).toFixed(6);
+        const lat = Cesium.Math.toDegrees(c.latitude).toFixed(6);
+        const alt = c.height.toFixed(2);
+        let labelText = `#${i+1}\nLon: ${lon}\nLat: ${lat}\nAlt: ${alt}m`;
+
+        const pointEntity = viewer.entities.add({
+          position: pos,
+          point: { pixelSize: pointSize, color: pointColor },
+          label: {
+            text: labelText,
+            font: '14px monospace',
+            fillColor: Cesium.Color.WHITE,
+            style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+            outlineWidth: 3,
+            outlineColor: Cesium.Color.BLACK,
+            verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+            pixelOffset: new Cesium.Cartesian2(0, -18)
+          }
+        });
+        entities.push(pointEntity);
+      });
+
+      if (drawingMode === 'line' && positions.length >= 2) {
+        const polyline = viewer.entities.add({
+          polyline: {
+            positions: positions,
+            width: 5,
+            material: Cesium.Color.ORANGE.withAlpha(0.9),
+            clampToGround: true
+          }
+        });
+        entities.push(polyline);
+      } else if (drawingMode === 'polygon' && positions.length >= 3) {
+        let polyPositions = positions.slice();
+        polyPositions.push(positions[0]);
+        const polygon = viewer.entities.add({
+          polygon: {
+            hierarchy: polyPositions,
+            material: Cesium.Color.RED.withAlpha(0.5),
+            outline: true,
+            outlineColor: Cesium.Color.BLUE,
+            perPositionHeight: false
+          }
+        });
+        entities.push(polygon);
+      }
+
+      updateInfo();
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+    handler.setInputAction(event => {
+      if (!drawing) return;
+      if (positions.length === 0) return;
+
+      const cartesian = viewer.scene.pickPosition(event.endPosition);
+      if (!cartesian) return;
+
+      entities.filter(e => e.name === 'preview').forEach(e => viewer.entities.remove(e));
+      entities = entities.filter(e => e.name !== 'preview');
+
+      if (drawingMode === 'line') {
+        let tempPositions = positions.concat([cartesian]);
+        const previewLine = viewer.entities.add({
+          name: 'preview',
+          polyline: {
+            positions: tempPositions,
+            width: 3,
+            material: Cesium.Color.BLUE.withAlpha(0.5),
+            clampToGround: true
+          }
+        });
+        entities.push(previewLine);
+      } else if (drawingMode === 'polygon' && positions.length >= 1) {
+        let tempPositions = positions.concat([cartesian, positions[0]]);
+        const previewPolygon = viewer.entities.add({
+          name: 'preview',
+          polygon: {
+            hierarchy: tempPositions,
+            material: Cesium.Color.LIME.withAlpha(0.15),
+            outline: true,
+            outlineColor: Cesium.Color.LIME.withAlpha(0.5),
+            perPositionHeight: false
+          }
+        });
+        entities.push(previewPolygon);
+      }
+
+      updateInfo();
+
+    }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+
+    handler.setInputAction(event => {
+      if (!drawing) return;
+      if (positions.length === 0) return;
+
+      drawing = false;
+      handler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_CLICK);
+      handler.removeInputAction(Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+      handler.removeInputAction(Cesium.ScreenSpaceEventType.RIGHT_CLICK);
+
+      entities.filter(e => e.name === 'preview').forEach(e => viewer.entities.remove(e));
+      entities = entities.filter(e => e.name !== 'preview');
+
+      updateInfo();
+      info.textContent += "\nΣχεδιασμός ολοκληρώθηκε.";
+    }, Cesium.ScreenSpaceEventType.RIGHT_CLICK);
+  }
+
+  function finishDrawing() {
+    drawing = false;
+    handler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    handler.removeInputAction(Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+    handler.removeInputAction(Cesium.ScreenSpaceEventType.RIGHT_CLICK);
+    info.textContent = "Σχεδιασμός τελείωσε. Μπορείς να ξεκινήσεις νέο.";
+  }
+
+  function clearAll() {
+    drawing = false;
+    positions = [];
+    entities.forEach(e => viewer.entities.remove(e));
+    entities = [];
+    handler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    handler.removeInputAction(Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+    handler.removeInputAction(Cesium.ScreenSpaceEventType.RIGHT_CLICK);
+    info.textContent = "Καθαρίστηκε το σκηνικό.";
+  }
+
+  function exportGeoJSON() {
+    if (positions.length === 0) {
+      alert("Δεν υπάρχει σχέδιο για εξαγωγή.");
+      return;
+    }
+    let geojson = null;
+    if (drawingMode === 'point') {
+      const c = Cesium.Cartographic.fromCartesian(positions[0]);
+      geojson = {
+        type: "FeatureCollection",
+        features: [{
+          type: "Feature",
+          geometry: {
+            type: "Point",
+            coordinates: [Cesium.Math.toDegrees(c.longitude), Cesium.Math.toDegrees(c.latitude)]
+          },
+          properties: {}
+        }]
+      };
+    } else if (drawingMode === 'line') {
+      const coords = positions.map(p => {
+        const c = Cesium.Cartographic.fromCartesian(p);
+        return [Cesium.Math.toDegrees(c.longitude), Cesium.Math.toDegrees(c.latitude)];
+      });
+      geojson = {
+        type: "FeatureCollection",
+        features: [{
+          type: "Feature",
+          geometry: {
+            type: "LineString",
+            coordinates: coords
+          },
+          properties: {}
+        }]
+      };
+    } else if (drawingMode === 'polygon') {
+      if (positions.length < 3) {
+        alert("Το πολύγωνο χρειάζεται τουλάχιστον 3 σημεία.");
+        return;
+      }
+      const coords = positions.map(p => {
+        const c = Cesium.Cartographic.fromCartesian(p);
+        return [Cesium.Math.toDegrees(c.longitude), Cesium.Math.toDegrees(c.latitude)];
+      });
+      coords.push(coords[0]);
+      geojson = {
+        type: "FeatureCollection",
+        features: [{
+          type: "Feature",
+          geometry: {
+            type: "Polygon",
+            coordinates: [coords]
+          },
+          properties: {}
+        }]
+      };
+    }
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(geojson, null, 2));
+    const dlAnchor = document.createElement('a');
+    dlAnchor.setAttribute("href", dataStr);
+    dlAnchor.setAttribute("download", "drawing.geojson");
+    dlAnchor.click();
+  }
+
+  proj4.defs("EPSG:2100","+proj=utm +zone=34 +ellps=GRS80 +units=m +no_defs");
+
+  function exportDXF() {
+    if (positions.length === 0) {
+      alert("Δεν υπάρχει σχέδιο για εξαγωγή.");
+      return;
+    }
+    let dxf = new DxfWriter();
+    dxf.setUnits('Meters');
+
+    if (drawingMode === 'point') {
+      positions.forEach(pos => {
+        const c = Cesium.Cartographic.fromCartesian(pos);
+        const xy = proj4('EPSG:4326','EPSG:2100',[Cesium.Math.toDegrees(c.longitude), Cesium.Math.toDegrees(c.latitude)]);
+        dxf.addPoint(xy[0], xy[1]);
+      });
+    } else if (drawingMode === 'line') {
+      const vertices = positions.map(pos => {
+        const c = Cesium.Cartographic.fromCartesian(pos);
+        return proj4('EPSG:4326','EPSG:2100',[Cesium.Math.toDegrees(c.longitude), Cesium.Math.toDegrees(c.latitude)]);
+      });
+      dxf.addPolyline(vertices);
+    } else if (drawingMode === 'polygon') {
+      if (positions.length < 3) {
+        alert("Το πολύγωνο χρειάζεται τουλάχιστον 3 σημεία.");
+        return;
+      }
+      let vertices = positions.map(pos => {
+        const c = Cesium.Cartographic.fromCartesian(pos);
+        return proj4('EPSG:4326','EPSG:2100',[Cesium.Math.toDegrees(c.longitude), Cesium.Math.toDegrees(c.latitude)]);
+      });
+      vertices.push(vertices[0]);
+      dxf.addPolyline(vertices, true);
+    }
+
+    const blob = new Blob([dxf.toDxfString()], {type: 'application/dxf'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = "drawing.dxf";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function openMyGeoData() {
+    if (positions.length === 0) {
+      alert("Δεν υπάρχει σχέδιο για ανέβασμα.");
+      return;
+    }
+    // Εξαγωγή GeoJSON σαν string
+    let geojsonStr = "";
+    if (drawingMode === 'point') {
+      const c = Cesium.Cartographic.fromCartesian(positions[0]);
+      geojsonStr = JSON.stringify({
+        type: "FeatureCollection",
+        features: [{
+          type: "Feature",
+          geometry: {
+            type: "Point",
+            coordinates: [Cesium.Math.toDegrees(c.longitude), Cesium.Math.toDegrees(c.latitude)]
+          },
+          properties: {}
+        }]
+      });
+    } else if (drawingMode === 'line') {
+      const coords = positions.map(p => {
+        const c = Cesium.Cartographic.fromCartesian(p);
+        return [Cesium.Math.toDegrees(c.longitude), Cesium.Math.toDegrees(c.latitude)];
+      });
+      geojsonStr = JSON.stringify({
+        type: "FeatureCollection",
+        features: [{
+          type: "Feature",
+          geometry: {
+            type: "LineString",
+            coordinates: coords
+          },
+          properties: {}
+        }]
+      });
+    } else if (drawingMode === 'polygon') {
+      if (positions.length < 3) {
+        alert("Το πολύγωνο χρειάζεται τουλάχιστον 3 σημεία.");
+        return;
+      }
+      const coords = positions.map(p => {
+        const c = Cesium.Cartographic.fromCartesian(p);
+        return [Cesium.Math.toDegrees(c.longitude), Cesium.Math.toDegrees(c.latitude)];
+      });
+      coords.push(coords[0]);
+      geojsonStr = JSON.stringify({
+        type: "FeatureCollection",
+        features: [{
+          type: "Feature",
+          geometry: {
+            type: "Polygon",
+            coordinates: [coords]
+          },
+          properties: {}
+        }]
+      });
+    }
+
+    // Αποθηκεύουμε προσωρινά το GeoJSON σε blob για να το ανεβάσουμε σαν αρχείο
+    const blob = new Blob([geojsonStr], {type: "application/json"});
+    const url = URL.createObjectURL(blob);
+
+    // Δημιουργούμε μια φόρμα και την υποβάλλουμε αυτόματα στο mygeodata.cloud
+    const form = document.createElement("form");
+    form.method = "POST";
+    form.action = "https://mygeodata.cloud/converter/";
+    form.target = "_blank";
+    form.enctype = "multipart/form-data";
+
+    const input = document.createElement("input");
+    input.type = "file";
+    input.name = "files[]";
+
+    // Δεν μπορούμε να προθέσουμε file blob απευθείας, οπότε
+    // Θα ανοίξουμε τη σελίδα σε νέο tab και ο χρήστης πρέπει να φορτώσει το αρχείο χειροκίνητα
+    // Εναλλακτικά, απλά ανοίγουμε τη σελίδα
+
+    // Άρα εδώ απλά ανοίγουμε το site για να ανεβάσει ο χρήστης το αρχείο χειροκίνητα
+    window.open("https://mapshaper.org/");
+  }
+
+  // Ξεκίνημα με σχεδιασμό πολυγώνου ως default
+  startDrawing('polygon');
+
+</script>
+</body>
+</html>
